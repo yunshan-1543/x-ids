@@ -1,0 +1,19 @@
+{
+  "results": [
+    {
+      "model": "cnn_lstm",
+      "accuracy": 0.9633,
+      "precision": 0.8285,
+      "recall": 0.9872,
+      "f1": 0.9009
+    },
+    {
+      "model": "transformer",
+      "accuracy": 0.9771,
+      "precision": 0.8915,
+      "recall": 0.9844,
+      "f1": 0.9357
+    }
+  ],
+  "note": "二分类,CNN-LSTM/Transformer"
+}

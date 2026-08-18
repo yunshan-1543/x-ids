@@ -1,0 +1,25 @@
+# ============ 大数据文件(可重新生成 / 过大,不上传) ============
+data/
+processed/
+MachineLearningCSV.zip
+*.zip
+
+# ============ 运行时数据 ============
+detector/alerts.db
+*.db
+
+# ============ 训练产物(仅保留部署所需模型) ============
+models/*.pkl
+models/*.pt
+models/rf_baseline.pkl
+models/xgb_baseline.json
+
+# ============ Python 缓存 ============
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# ============ 本地配置与工作文件 ============
+.claude/
+CLAUDE.md
+.venv/

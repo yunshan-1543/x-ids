@@ -1,0 +1,29 @@
+{
+  "task": "多分类(8类)",
+  "class_names": [
+    "BENIGN",
+    "DDoS",
+    "PortScan",
+    "Botnet",
+    "BruteForce",
+    "WebAttack",
+    "DoS",
+    "Infiltration"
+  ],
+  "results": [
+    {
+      "model": "cnn_lstm",
+      "task": "多分类(8类)",
+      "accuracy": 0.7714,
+      "macro_f1": 0.4042,
+      "weighted_f1": 0.8349
+    },
+    {
+      "model": "transformer",
+      "task": "多分类(8类)",
+      "accuracy": 0.8629,
+      "macro_f1": 0.463,
+      "weighted_f1": 0.9
+    }
+  ]
+}

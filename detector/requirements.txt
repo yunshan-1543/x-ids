@@ -1,0 +1,12 @@
+# CICIDS2017 实时入侵检测服务依赖
+fastapi>=0.110
+uvicorn>=0.29
+xgboost>=2.0
+numpy
+pandas
+
+# SHAP 模型解释(告警详情页的"影响最大的特征")
+shap>=0.45
+
+# 可选:Scapy 实时抓包(需另装 Npcap,见 README)
+scapy>=2.5

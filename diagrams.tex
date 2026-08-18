@@ -1,0 +1,135 @@
+% =====================================================================
+% 可解释AI实时入侵检测平台 — 两张核心图(TikZ)
+% ---------------------------------------------------------------------
+%  图1: 系统架构图(System Architecture)   —— 平台运行时如何检测攻击
+%  图2: 模型训练流程图(Model Training Pipeline) —— AI 模型如何训练而来
+%
+% 编译方式(pdflatex 即可,标签为英文,避免中文字体依赖):
+%   pdflatex diagrams.tex
+%
+% 如需中文标签:用 xelatex + ctex,并把 XeLaTeX 首行解注释:
+%   % !TEX program = xelatex
+% =====================================================================
+\documentclass[11pt]{article}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, calc}
+
+% ---------- 通用节点样式 ----------
+\tikzset{
+  % 主流程框: main=<颜色>, 突出边框与填充
+  main/.style 2 args={draw=#2!75!black, fill=#2!14, rounded corners=3pt,
+    minimum width=#1, minimum height=0.95cm, align=center, font=\small\bfseries},
+  % 分支/子模块框
+  branch/.style 2 args={draw=#2!75!black, fill=#2!10, rounded corners=3pt,
+    minimum width=#1, minimum height=0.85cm, align=center, font=\small},
+  % 箭头
+  arr/.style={-{Stealth[length=2.6mm]}, thick, color=gray!70},
+}
+
+\begin{document}
+
+% =====================================================================
+%  图 1: 系统架构图
+% =====================================================================
+\section*{Fig. 1\ \ System Architecture (Runtime Detection Flow)}
+\vspace{-0.4em}
+
+\begin{center}
+\begin{tikzpicture}
+  % ---- 主流程(居中列 x=0) ----
+  \node[main={4.6cm}{blue}]    (nt)  at (0,-0.0) {Network Traffic\\\scriptsize 网络流量};
+  \node[branch={3.6cm}{blue}]  (pp)  at (-2.3,-1.5) {PCAP Replay};
+  \node[branch={3.6cm}{blue}]  (rc)  at ( 2.3,-1.5) {Real-time Capture};
+  \node[main={4.6cm}{teal}]    (tp)  at (0,-3.0) {Traffic Parser\\\scriptsize 流量解析};
+  \node[main={4.6cm}{teal}]    (fe)  at (0,-4.2) {Feature Extraction\\\scriptsize 特征提取 (69 维)};
+  \node[main={4.6cm}{orange}]  (ml)  at (0,-5.4) {ML Detection Engine};
+  \node[main={4.6cm}{red}]     (xgb) at (0,-6.6) {XGBoost Multi-class IDS\\\scriptsize 8 类威胁};
+  \node[branch={3.6cm}{red}]   (ap)  at (-2.3,-7.8) {Attack Prediction\\\scriptsize 攻击预测};
+  \node[branch={3.6cm}{violet}](se)  at ( 2.3,-7.8) {SHAP Explain\\\scriptsize 可解释归因};
+  \node[main={4.6cm}{orange}]  (re)  at (0,-9.0) {Risk Engine\\\scriptsize 风险引擎};
+  \node[main={4.6cm}{green}]   (am)  at (0,-10.2) {Alert Management\\\scriptsize 告警管理};
+  \node[branch={3.4cm}{green}] (soc) at (-3.3,-11.4) {SOC UI};
+  \node[branch={3.4cm}{green}] (sql) at ( 0,-11.4)  {SQLite DB};
+  \node[branch={3.4cm}{green}] (csv) at ( 3.3,-11.4) {CSV Report};
+  \node[main={4.6cm}{gray}]    (doc) at (0,-12.9) {Docker Deploy};
+
+  % ---- 箭头:分流/汇聚 ----
+  \draw[arr] (nt.south) -- (pp.north);
+  \draw[arr] (nt.south) -- (rc.north);
+  \draw[arr] (pp.south) -- (tp.north west);
+  \draw[arr] (rc.south) -- (tp.north east);
+  \draw[arr] (tp.south) -- (fe.north);
+  \draw[arr] (fe.south) -- (ml.north);
+  \draw[arr] (ml.south) -- (xgb.north);
+  \draw[arr] (xgb.south) -- (ap.north);
+  \draw[arr] (xgb.south) -- (se.north);
+  \draw[arr] (ap.south) -- (re.north west);
+  \draw[arr] (se.south) -- (re.north east);
+  \draw[arr] (re.south) -- (am.north);
+  \draw[arr] (am.south) -- (soc.north);
+  \draw[arr] (am.south) -- (sql.north);
+  \draw[arr] (am.south) -- (csv.north);
+  \draw[arr] (soc.south) -- (doc.north west);
+  \draw[arr] (sql.south) -- (doc.north);
+  \draw[arr] (csv.south) -- (doc.north east);
+\end{tikzpicture}
+\end{center}
+
+\vspace{0.4em}
+{\small\noindent\textbf{说明}:本图回答"平台运行时如何检测攻击"——从流量采集到可解释告警的端到端闭环,
+体现 采集 → 特征 → 检测 → 解释 → 风险 → 运营 → 部署 的产品能力。}
+
+\clearpage
+
+% =====================================================================
+%  图 2: 模型训练流程图
+% =====================================================================
+\section*{Fig. 2\ \ Model Training Pipeline (Offline)}
+\vspace{-0.4em}
+
+\begin{center}
+\begin{tikzpicture}
+  % ---- 数据模块 ----
+  \node[main={6.0cm}{blue}]   (ds)  at (0,0.0)  {CICIDS2017 Dataset\\\scriptsize 80+ Features \,$\cdot$\, BENIGN + 14 Attacks};
+  \node[main={6.0cm}{teal}]   (dp)  at (0,-1.6) {Data Preprocessing\\\scriptsize Cleaning / Encoding / Balance\\\scriptsize 缺失值 \,$\cdot$\, 非法样本 \,$\cdot$\, 类别不平衡};
+  \node[main={6.0cm}{teal}]   (ft)  at (0,-3.2) {Traffic Feature Engineering\\\scriptsize 流统计特征\\\scriptsize Flow Duration / Packet Length \& Count / SYN Flag / Byte Rate / IAT};
+  \node[main={6.0cm}{violet}] (lb)  at (0,-4.8) {Label Processing\\\scriptsize Binary: BENIGN vs Attack\\\scriptsize 8-class: DDoS/DoS/PortScan/BruteForce/WebAttack/Botnet};
+  \node[main={6.0cm}{cyan}]   (sp)  at (0,-6.4) {Dataset Construction\\\scriptsize Train 80\% \,$|$\, Test 20\% (Stratified, seed=42)};
+
+  % ---- 多模型对比 ----
+  \node[branch={3.6cm}{orange}] (m1) at (-4.6,-8.2) {RandomForest};
+  \node[branch={3.6cm}{red}]    (m2) at (-1.5,-8.2) {XGBoost};
+  \node[branch={3.6cm}{orange}] (m3) at ( 1.5,-8.2) {CNN-LSTM};
+  \node[branch={3.6cm}{orange}] (m4) at ( 4.6,-8.2) {Transformer};
+
+  % ---- 最优模型 ----
+  \node[main={6.0cm}{red}]    (bm)  at (0,-9.9) {Best Model: XGBoost\\\scriptsize 二分类 F1 $=$ 0.9974};
+
+  % ---- 评估 + 解释 ----
+  \node[main={6.0cm}{green}]  (ev)  at (0,-11.5) {Model Evaluation\\\scriptsize Accuracy / Precision / Recall / F1 / Confusion Matrix\\\scriptsize 多分类关注 Macro-F1};
+  \node[main={6.0cm}{violet}] (sh)  at (0,-13.1) {Explainable AI Analysis\\\scriptsize SHAP Feature Importance\\\scriptsize Black-box $\rightarrow$ Interpretable};
+
+  % ---- 箭头 ----
+  \draw[arr] (ds.south) -- (dp.north);
+  \draw[arr] (dp.south) -- (ft.north);
+  \draw[arr] (ft.south) -- (lb.north);
+  \draw[arr] (lb.south) -- (sp.north);
+  \draw[arr] (sp.south) -- (m1.north);
+  \draw[arr] (sp.south) -- (m2.north);
+  \draw[arr] (sp.south) -- (m3.north);
+  \draw[arr] (sp.south) -- (m4.north);
+  \draw[arr] (m1.south) -- (bm.north west);
+  \draw[arr] (m2.south) -- (bm.north);
+  \draw[arr] (m3.south) -- (bm.north);
+  \draw[arr] (m4.south) -- (bm.north east);
+  \draw[arr] (bm.south) -- (ev.north);
+  \draw[arr] (ev.south) -- (sh.north);
+\end{tikzpicture}
+\end{center}
+
+\vspace{0.4em}
+{\small\noindent\textbf{说明}:本图回答"AI 模型是如何训练出来的、结果为何可信"——数据质量、特征口径、
+标签任务、训练/测试划分、多模型对比、评估指标、可解释分析 七个环节,保证实验规范、可复现。}
+
+\end{document}

@@ -1,0 +1,37 @@
+# 可解释AI实时入侵检测平台 — Docker Compose
+# 运行: docker compose up -d --build
+# 访问: http://localhost:8000
+version: "3.8"
+
+services:
+  # 前端 + 后端 + 模型:FastAPI 一个容器承载(静态面板由 FastAPI 托管)
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ids-backend
+    ports:
+      - "8000:8000"
+    environment:
+      MODELS_DIR: /app/models      # 模型目录(镜像内)
+      DB_PATH: /data/alerts.db     # SQLite 数据库(持久卷)
+    volumes:
+      - alert_data:/data
+    depends_on:
+      - database
+    restart: unless-stopped
+
+  # 数据库组件:SQLite 是文件型数据库,由独立容器挂载并持有持久卷,
+  # 保证数据落盘、重启/重建容器不丢失,也可进入容器查看 alerts 表
+  database:
+    image: busybox:latest
+    container_name: ids-database
+    entrypoint: ["sh", "-c"]
+    command: "sleep 999999999"
+    volumes:
+      - alert_data:/data
+    restart: unless-stopped
+
+volumes:
+  alert_data:
+    name: ids-alert-data

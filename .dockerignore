@@ -1,0 +1,24 @@
+# 排除大型数据与无关目录,加快构建
+data/
+processed/
+src/
+notebooks/
+reports/
+samples/
+
+# 模型只保留检测所需的两个文件(由 Dockerfile 显式 COPY)
+models/*.pkl
+models/*.pt
+models/rf_baseline.pkl
+models/xgb_baseline.json
+models/cnn_lstm.pt
+models/transformer.pt
+models/ids_cnn_lstm.pt
+models/ids_transformer.pt
+
+# 运行产物与缓存
+detector/alerts.db
+detector/samples/*.pcap
+__pycache__/
+*.pyc
+.pytest_cache/
