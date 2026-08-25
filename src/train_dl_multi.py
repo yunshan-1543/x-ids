@@ -5,6 +5,7 @@ CICIDS2017 多分类深度学习模型(8 类)
 类别: BENIGN / DDoS / PortScan / Botnet / BruteForce / WebAttack / DoS / Infiltration
 模型: CNN-LSTM / Transformer(输出维度 = 8,逆频类别权重)
 预处理与二分类一致: 分层抽样 30 万 -> StandardScaler -> 裁剪 ±10 -> 补零成序列 [N,128,1]
+训练策略: 训练集内部再划分验证集,最多 50 epoch,验证损失早停并回滚最佳权重
 保存为完整 checkpoint,便于推理:
   models/ids_cnn_lstm.pt
   models/ids_transformer.pt
@@ -39,11 +40,15 @@ REPORT = ROOT / "reports" / "dl_multi_results.json"
 
 RANDOM_STATE = 42
 SEQUENCE_LEN = 128
-N_EPOCHS = 10
+MAX_EPOCHS = 50
+PATIENCE = 8
+MIN_DELTA = 1e-4
 BATCH_SIZE = 1024
 LEARNING_RATE = 1e-3
+WEIGHT_DECAY = 1e-4
 CLIP_VALUE = 10.0
 TRAIN_SAMPLE = 300_000
+VAL_SIZE = 0.1
 N_CLASSES = len(CLASS_NAMES)
 
 
@@ -127,7 +132,8 @@ class TransformerModel(nn.Module):
         self.input_proj = nn.Linear(1, d_model)
         self.pos_embed = nn.Parameter(torch.randn(1, seq_len, d_model) * 0.02)
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=nhead, batch_first=True, dim_feedforward=256)
+            d_model=d_model, nhead=nhead, batch_first=True, dim_feedforward=256,
+            dropout=0.1)
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.cls = nn.Linear(d_model, num_classes)
 
@@ -137,14 +143,32 @@ class TransformerModel(nn.Module):
         return self.cls(x.mean(dim=1))
 
 
-def train_model(name: str, model: nn.Module, train_loader, test_loader, y_train,
+def evaluate_loss(model: nn.Module, loader, criterion, dev) -> float:
+    model.eval()
+    total_loss, n_batch = 0.0, 0
+    with torch.no_grad():
+        for xb, yb in loader:
+            xb, yb = xb.to(dev), yb.to(dev)
+            total_loss += criterion(model(xb), yb).item()
+            n_batch += 1
+    return total_loss / max(n_batch, 1)
+
+
+def train_model(name: str, model: nn.Module, train_loader, val_loader, test_loader,
                 dev, class_weight: torch.Tensor) -> dict:
     criterion = nn.CrossEntropyLoss(weight=class_weight.to(dev))
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE,
+                                  weight_decay=WEIGHT_DECAY)
     model.to(dev)
     print(f"\n========== 训练 {name}({N_CLASSES} 类) ==========")
 
-    for epoch in range(N_EPOCHS):
+    best_val = float("inf")
+    best_state = None
+    best_epoch = 0
+    wait = 0
+    train_losses, val_losses = [], []
+
+    for epoch in range(MAX_EPOCHS):
         model.train()
         total_loss, n_batch = 0.0, 0
         for xb, yb in train_loader:
@@ -156,8 +180,26 @@ def train_model(name: str, model: nn.Module, train_loader, test_loader, y_train,
             optimizer.step()
             total_loss += loss.item()
             n_batch += 1
-        if (epoch + 1) % 2 == 0 or epoch == N_EPOCHS - 1:
-            print(f"  epoch {epoch+1}/{N_EPOCHS}  loss={total_loss/n_batch:.4f}")
+        train_loss = total_loss / max(n_batch, 1)
+        val_loss = evaluate_loss(model, val_loader, criterion, dev)
+        train_losses.append(round(float(train_loss), 6))
+        val_losses.append(round(float(val_loss), 6))
+        if val_loss < best_val - MIN_DELTA:
+            best_val = val_loss
+            best_epoch = epoch + 1
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            wait = 0
+        else:
+            wait += 1
+        if (epoch + 1) % 2 == 0 or epoch == 0:
+            print(f"  epoch {epoch+1}/{MAX_EPOCHS}  train_loss={train_loss:.4f}  "
+                  f"val_loss={val_loss:.4f}  best_epoch={best_epoch}")
+        if wait >= PATIENCE:
+            print(f"  [早停] 验证损失连续 {PATIENCE} 轮无显著改善,最佳 epoch={best_epoch}")
+            break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
 
     model.eval()
     preds, labels = [], []
@@ -180,6 +222,12 @@ def train_model(name: str, model: nn.Module, train_loader, test_loader, y_train,
         "accuracy": round(float(acc), 4),
         "macro_f1": round(float(macro), 4),
         "weighted_f1": round(float(weighted), 4),
+        "best_epoch": best_epoch,
+        "max_epochs": MAX_EPOCHS,
+        "early_stopping_patience": PATIENCE,
+        "best_val_loss": round(float(best_val), 6),
+        "train_loss_curve": train_losses,
+        "val_loss_curve": val_losses,
     }
 
 
@@ -193,14 +241,20 @@ def main() -> None:
     dev = device()
     X, y, feature_cols = load_data()
     X_train, X_test, y_train, y_test, sc = split_standardize(X, y)
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_train, y_train, test_size=VAL_SIZE, random_state=RANDOM_STATE,
+        stratify=y_train)
 
     seq = to_sequence(X_train, SEQUENCE_LEN)
+    seq_val = to_sequence(X_val, SEQUENCE_LEN)
     seq_test = to_sequence(X_test, SEQUENCE_LEN)
-    print(f"[序列] 训练 {seq.shape}  测试 {seq_test.shape}")
+    print(f"[序列] 训练 {seq.shape}  验证 {seq_val.shape}  测试 {seq_test.shape}")
 
     train_ds = TensorDataset(torch.FloatTensor(seq), torch.LongTensor(y_train))
+    val_ds = TensorDataset(torch.FloatTensor(seq_val), torch.LongTensor(y_val))
     test_ds = TensorDataset(torch.FloatTensor(seq_test), torch.LongTensor(y_test))
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE)
     test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE)
 
     # 逆频类别权重:每类总权重相等,缓解严重失衡
@@ -213,7 +267,7 @@ def main() -> None:
     results = []
     for name, build in [("cnn_lstm", CNNLSTM), ("transformer", TransformerModel)]:
         model = build(seq.shape[2], SEQUENCE_LEN, N_CLASSES)
-        res = train_model(name, model, train_loader, test_loader, y_train, dev, cw)
+        res = train_model(name, model, train_loader, val_loader, test_loader, dev, cw)
         results.append(res)
         torch.save({
             "state_dict": model.state_dict(),
@@ -229,7 +283,18 @@ def main() -> None:
 
     with open(REPORT, "w", encoding="utf-8") as f:
         json.dump({"task": "多分类(8类)", "class_names": CLASS_NAMES,
-                   "results": results}, f, ensure_ascii=False, indent=2)
+                   "results": results,
+                   "config": {
+                       "train_sample": TRAIN_SAMPLE,
+                       "test_size": 0.2,
+                       "val_size_from_train": VAL_SIZE,
+                       "max_epochs": MAX_EPOCHS,
+                       "patience": PATIENCE,
+                       "learning_rate": LEARNING_RATE,
+                       "weight_decay": WEIGHT_DECAY,
+                       "batch_size": BATCH_SIZE,
+                       "sequence_len": SEQUENCE_LEN,
+                   }}, f, ensure_ascii=False, indent=2)
     print(f"\n[结果] {REPORT}")
 
 

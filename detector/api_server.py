@@ -132,7 +132,7 @@ def _simulate_emit(attack, confidence, src, features, meta) -> None:
     # 模拟器返回 numpy 向量,转成 {特征名: 值} dict,便于证据规则与 SHAP 复用
     if isinstance(features, (list, tuple)) or hasattr(features, "tolist"):
         features = {col: float(v) for col, v in zip(inf._feature_cols, features)}
-    _handle_detection(attack, confidence, src, features=features, meta=meta)
+    _handle_detection(attack, confidence, "simulate", features=features, meta=meta)
 
 
 # ---------------- 实时抓包 / pcap 回放 ----------------
@@ -140,6 +140,16 @@ _capture_thread: threading.Thread | None = None
 _capture_stop: threading.Event | None = None
 _scan = PortScanDetector(max_ports=15, window=30.0)
 _syn_flood = SynFloodDetector(max_syn=100, window=10.0)
+_capture_stats = {
+    "active": False,
+    "mode": "",
+    "iface": "",
+    "started_at": 0.0,
+    "packets": 0,
+    "flows": 0,
+    "alerts": 0,
+    "last_error": "",
+}
 
 
 def _capture_emit(features: dict, meta: dict) -> None:
@@ -150,12 +160,15 @@ def _capture_emit(features: dict, meta: dict) -> None:
     except Exception:  # noqa: BLE001
         return
 
+    _capture_stats["flows"] += 1
     if r["attack"] != "BENIGN":
+        _capture_stats["alerts"] += 1
         _handle_detection(r["attack"], r["confidence"], "capture",
                           features=features, meta=meta)
 
     hit = _scan.feed(meta)
     if hit:
+        _capture_stats["alerts"] += 1
         _handle_detection(
             "PortScan", 0.92, "capture",
             features={},
@@ -169,6 +182,7 @@ def _capture_emit(features: dict, meta: dict) -> None:
 
     flood = _syn_flood.feed(features, meta)
     if flood:
+        _capture_stats["alerts"] += 1
         _handle_detection(
             "DoS", 0.93, "capture",
             features=features, meta=meta,
@@ -262,6 +276,7 @@ async def explain_by_id(event_id: str) -> JSONResponse:
                             content={"error": "shap 未安装,请执行: pip install shap"})
     except Exception as exc:  # noqa: BLE001
         return JSONResponse(status_code=400, content={"error": str(exc)})
+    result["features"] = features  # 附带该事件的原始特征,供详情页"完整特征"区块展示
     db.update_shap(event_id, json.dumps(result, ensure_ascii=False))  # 缓存解释,历史可回看
     return JSONResponse(result)
 
@@ -275,6 +290,8 @@ async def events_stream(request: Request) -> StreamingResponse:
         while True:
             if await request.is_disconnected():
                 break
+            if last > len(_events):
+                last = len(_events)
             if len(_events) > last:
                 for ev in _events[last:]:
                     yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
@@ -360,6 +377,22 @@ async def simulate_stop() -> JSONResponse:
     return JSONResponse({"status": "stopped"})
 
 
+@app.post("/simulate/clear")
+async def simulate_clear() -> JSONResponse:
+    """清空模拟来源的告警,避免新一轮模拟与上一轮演示混在一起。"""
+    global _events
+    try:
+        sim_ids = {ev["id"] for ev in _events if ev.get("src") == "simulate"}
+        _events = [ev for ev in _events if ev.get("src") != "simulate"]
+        for event_id in sim_ids:
+            _feature_store.pop(event_id, None)
+        deleted = db.delete_alerts_by_source("simulate")
+        return JSONResponse({"status": "cleared", "source": "simulate",
+                             "memory_deleted": len(sim_ids), "db_deleted": deleted})
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+
+
 @app.post("/capture/start")
 async def capture_start(payload: dict | None = None) -> JSONResponse:
     """Scapy 实时抓包。需要 scapy + Npcap + 管理员权限。"""
@@ -370,13 +403,40 @@ async def capture_start(payload: dict | None = None) -> JSONResponse:
     if not _SCAPY_OK:
         return JSONResponse(status_code=400, content={
             "error": "scapy 未安装或不可用,请执行 pip install scapy 并安装 Npcap"})
-    iface = (payload or {}).get("iface")
+    payload = payload or {}
+    iface = (payload.get("iface") or "").strip() or None
+    idle_timeout = float(payload.get("idle_timeout") or 15.0)
+    bpf_filter = (payload.get("filter") or "").strip() or None
     _capture_stop = threading.Event()
+
+    def _on_packet(_pkt) -> None:
+        _capture_stats["packets"] += 1
+
+    def _run_capture() -> None:
+        _capture_stats.update({
+            "active": True,
+            "mode": "live",
+            "iface": iface or "默认网卡",
+            "started_at": time.time(),
+            "packets": 0,
+            "flows": 0,
+            "alerts": 0,
+            "last_error": "",
+        })
+        try:
+            sniff_loop(interface=iface, on_flow=_capture_emit, on_packet=_on_packet,
+                       stop_event=_capture_stop, idle_timeout=idle_timeout,
+                       bpf_filter=bpf_filter)
+        except Exception as exc:  # noqa: BLE001
+            _capture_stats["last_error"] = str(exc)
+        finally:
+            _capture_stats["active"] = False
+
     _capture_thread = threading.Thread(
-        target=sniff_loop, kwargs={"interface": iface, "on_flow": _capture_emit,
-                                   "stop_event": _capture_stop}, daemon=True)
+        target=_run_capture, daemon=True)
     _capture_thread.start()
-    return JSONResponse({"status": "started", "iface": iface or "默认网卡"})
+    return JSONResponse({"status": "started", "iface": iface or "默认网卡",
+                         "idle_timeout": idle_timeout, "filter": bpf_filter or ""})
 
 
 @app.post("/capture/stop")
@@ -386,6 +446,29 @@ async def capture_stop() -> JSONResponse:
         _capture_stop.set()
         _capture_thread.join(timeout=5)
     return JSONResponse({"status": "stopped"})
+
+
+@app.get("/capture/status")
+async def capture_status() -> dict:
+    active = bool(_capture_thread and _capture_thread.is_alive())
+    _capture_stats["active"] = active
+    out = dict(_capture_stats)
+    out["uptime_seconds"] = round(time.time() - out["started_at"], 1) if active else 0
+    return out
+
+
+@app.get("/capture/interfaces")
+async def capture_interfaces() -> JSONResponse:
+    """列出 Scapy 可见网卡,用于前端选择真实抓包接口。"""
+    from flow_extractor import _SCAPY_OK
+    if not _SCAPY_OK:
+        return JSONResponse(status_code=400, content={
+            "error": "scapy 未安装或不可用,请执行 pip install scapy 并安装 Npcap"})
+    try:
+        from scapy.all import get_if_list
+        return JSONResponse({"interfaces": get_if_list()})
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse(status_code=400, content={"error": str(exc)})
 
 
 @app.post("/capture/replay")

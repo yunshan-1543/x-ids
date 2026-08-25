@@ -320,15 +320,20 @@ class FlowExtractor:
         return len(self.flows)
 
 
-def sniff_loop(interface=None, on_flow=None, on_packet=None, count=None, stop_event=None):
+def sniff_loop(interface=None, on_flow=None, on_packet=None, count=None,
+               stop_event=None, idle_timeout: float = IDLE_TIMEOUT,
+               bpf_filter: str | None = None):
     """阻塞式实时抓包:每来一个包更新流状态,超时流回调 on_flow(features, meta)。"""
     if not _SCAPY_OK:
         print("[scapy] 未安装: pip install scapy,并安装 Npcap(WinPcap)后才能实时抓包")
         return
     from scapy.all import sniff
-    extractor = FlowExtractor()
+    extractor = FlowExtractor(idle_timeout=idle_timeout)
+    seen = 0
 
     def _pkt(pkt):
+        nonlocal seen
+        seen += 1
         extractor.process(pkt)
         if on_packet:
             on_packet(pkt)
@@ -340,7 +345,20 @@ def sniff_loop(interface=None, on_flow=None, on_packet=None, count=None, stop_ev
         return bool(stop_event is not None and stop_event.is_set())
 
     print(f"[抓包] 开始监听 {interface or '默认网卡'}(Ctrl+C 停止)")
-    sniff(iface=interface, prn=_pkt, store=False, count=count, stop_filter=_stop)
+    while not (stop_event is not None and stop_event.is_set()):
+        if count is not None and seen >= count:
+            break
+        remaining = 0 if count is None else max(count - seen, 0)
+        sniff(iface=interface, prn=_pkt, store=False, count=remaining,
+              stop_filter=_stop, filter=bpf_filter, timeout=1)
+        for feat, meta in extractor.expire():
+            if on_flow:
+                on_flow(feat, meta)
+
+    # 停止时结算剩余活跃流,避免短演示里没有任何流到期。
+    for feat, meta in extractor.expire(now=float("inf")):
+        if on_flow:
+            on_flow(feat, meta)
 
 
 def replay_pcap(path: str, on_flow=None, progress=None):

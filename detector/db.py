@@ -42,6 +42,11 @@ def init_db() -> None:
             )
             """
         )
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(alerts)").fetchall()}
+        if "shap_result" not in cols:
+            conn.execute("ALTER TABLE alerts ADD COLUMN shap_result TEXT")
+        if "source" not in cols:
+            conn.execute("ALTER TABLE alerts ADD COLUMN source TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts(timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_risk ON alerts(risk_level)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_type ON alerts(attack_type)")
@@ -82,6 +87,17 @@ def update_shap(event_id: str, shap_json: str) -> None:
     try:
         conn.execute("UPDATE alerts SET shap_result=? WHERE id=?", (shap_json, event_id))
         conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_alerts_by_source(source: str) -> int:
+    """删除指定来源的告警,返回删除条数。"""
+    conn = _conn()
+    try:
+        cur = conn.execute("DELETE FROM alerts WHERE source=?", (source,))
+        conn.commit()
+        return int(cur.rowcount or 0)
     finally:
         conn.close()
 

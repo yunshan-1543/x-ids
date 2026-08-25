@@ -7,7 +7,7 @@ CICIDS2017 深度学习检测模型
 
 步骤:
   1. 加载清洗后数据,分层抽样训练集
-  2. 特征标准化 + 维度重塑
+  2. 特征标准化 + 维度重塑 + 验证集早停
   3. 训练 CNN-LSTM
   4. 训练 Transformer(可选,受数据量/设备控制)
   5. 保存模型与评估结果
@@ -41,10 +41,14 @@ REPORT = ROOT / "reports" / "dl_results.json"
 LABEL_COL = "label"  # 清洗后 parquet 列名为小写
 RANDOM_STATE = 42
 SEQUENCE_LEN = 128      # 把特征切块当时间步用(LSTM/Transformer 输入)
-N_EPOCHS = 10
+MAX_EPOCHS = 50
+PATIENCE = 8
+MIN_DELTA = 1e-4
 BATCH_SIZE = 1024
 LEARNING_RATE = 1e-3
+WEIGHT_DECAY = 1e-4
 TRAIN_SAMPLE = 300_000  # 分层抽样上限
+VAL_SIZE = 0.1
 
 
 def set_seed(seed=42):
@@ -129,7 +133,8 @@ class TransformerModel(nn.Module):
         self.input_proj = nn.Linear(1, d_model)
         self.pos_embed = nn.Parameter(torch.randn(1, seq_len, d_model) * 0.02)
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=nhead, batch_first=True, dim_feedforward=256)
+            d_model=d_model, nhead=nhead, batch_first=True, dim_feedforward=256,
+            dropout=0.1)
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.cls = nn.Linear(d_model, 2)
 
@@ -139,18 +144,36 @@ class TransformerModel(nn.Module):
         return self.cls(x.mean(dim=1))
 
 
-def train_model(name: str, model: nn.Module, train_loader, test_loader,
-                dev, epochs=N_EPOCHS, class_weight=None) -> dict:
+def evaluate_loss(model: nn.Module, loader, criterion, dev) -> float:
+    model.eval()
+    total_loss, n_batch = 0.0, 0
+    with torch.no_grad():
+        for xb, yb in loader:
+            xb, yb = xb.to(dev), yb.to(dev)
+            total_loss += criterion(model(xb), yb).item()
+            n_batch += 1
+    return total_loss / max(n_batch, 1)
+
+
+def train_model(name: str, model: nn.Module, train_loader, val_loader, test_loader,
+                dev, max_epochs=MAX_EPOCHS, class_weight=None) -> dict:
     # 类别不均衡:传入类别权重(如逆频)可显著提升少数类(Attack)召回
     if class_weight is not None:
         criterion = nn.CrossEntropyLoss(weight=class_weight.to(dev))
     else:
         criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE,
+                                  weight_decay=WEIGHT_DECAY)
     model.to(dev)
     print(f"\n========== 训练 {name} ==========")
 
-    for epoch in range(epochs):
+    best_val = float("inf")
+    best_state = None
+    best_epoch = 0
+    wait = 0
+    train_losses, val_losses = [], []
+
+    for epoch in range(max_epochs):
         model.train()
         total_loss, n_batch = 0.0, 0
         for xb, yb in train_loader:
@@ -162,8 +185,26 @@ def train_model(name: str, model: nn.Module, train_loader, test_loader,
             optimizer.step()
             total_loss += loss.item()
             n_batch += 1
-        if (epoch + 1) % 2 == 0 or epoch == epochs - 1:
-            print(f"  epoch {epoch+1}/{epochs}  loss={total_loss/n_batch:.4f}")
+        train_loss = total_loss / max(n_batch, 1)
+        val_loss = evaluate_loss(model, val_loader, criterion, dev)
+        train_losses.append(round(float(train_loss), 6))
+        val_losses.append(round(float(val_loss), 6))
+        if val_loss < best_val - MIN_DELTA:
+            best_val = val_loss
+            best_epoch = epoch + 1
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            wait = 0
+        else:
+            wait += 1
+        if (epoch + 1) % 2 == 0 or epoch == 0:
+            print(f"  epoch {epoch+1}/{max_epochs}  train_loss={train_loss:.4f}  "
+                  f"val_loss={val_loss:.4f}  best_epoch={best_epoch}")
+        if wait >= PATIENCE:
+            print(f"  [早停] 验证损失连续 {PATIENCE} 轮无显著改善,最佳 epoch={best_epoch}")
+            break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
 
     # 评估
     model.eval()
@@ -182,6 +223,12 @@ def train_model(name: str, model: nn.Module, train_loader, test_loader,
         "precision": round(float(precision_score(y_true, y_pred)), 4),
         "recall": round(float(recall_score(y_true, y_pred)), 4),
         "f1": round(float(f1_score(y_true, y_pred)), 4),
+        "best_epoch": best_epoch,
+        "max_epochs": max_epochs,
+        "early_stopping_patience": PATIENCE,
+        "best_val_loss": round(float(best_val), 6),
+        "train_loss_curve": train_losses,
+        "val_loss_curve": val_losses,
     }
     print(f"  {name}: Accuracy={res['accuracy']:.4f} Precision={res['precision']:.4f} "
           f"Recall={res['recall']:.4f} F1={res['f1']:.4f}")
@@ -195,15 +242,21 @@ def main():
     dev = device()
     X, y = load_data()
     X_train, X_test, y_train, y_test, sc = split_standardize(X, y)
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_train, y_train, test_size=VAL_SIZE, random_state=RANDOM_STATE,
+        stratify=y_train)
 
     seq = to_sequence(X_train, SEQUENCE_LEN)
+    seq_val = to_sequence(X_val, SEQUENCE_LEN)
     seq_test = to_sequence(X_test, SEQUENCE_LEN)
     n_feat = seq.shape[2]
-    print(f"[序列] 训练 {seq.shape}  测试 {seq_test.shape}")
+    print(f"[序列] 训练 {seq.shape}  验证 {seq_val.shape}  测试 {seq_test.shape}")
 
     train_ds = TensorDataset(torch.FloatTensor(seq), torch.LongTensor(y_train))
+    val_ds = TensorDataset(torch.FloatTensor(seq_val), torch.LongTensor(y_val))
     test_ds = TensorDataset(torch.FloatTensor(seq_test), torch.LongTensor(y_test))
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE)
     test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE)
 
     results = []
@@ -214,17 +267,31 @@ def main():
     class_weight = torch.tensor([1.0, n_neg / n_pos])
 
     cnn_lstm = CNNLSTM(n_feat, SEQUENCE_LEN)
-    res = train_model("cnn_lstm", cnn_lstm, train_loader, test_loader, dev,
+    res = train_model("cnn_lstm", cnn_lstm, train_loader, val_loader, test_loader, dev,
                       class_weight=class_weight)
     results.append(res)
 
     transformer = TransformerModel(n_feat, SEQUENCE_LEN)
-    res = train_model("transformer", transformer, train_loader, test_loader, dev,
+    res = train_model("transformer", transformer, train_loader, val_loader, test_loader, dev,
                       class_weight=class_weight)
     results.append(res)
 
     with open(REPORT, "w", encoding="utf-8") as f:
-        json.dump({"results": results, "note": "二分类,CNN-LSTM/Transformer"}, f,
+        json.dump({
+            "results": results,
+            "note": "二分类,CNN-LSTM/Transformer; 训练集内部划分验证集并使用早停",
+            "config": {
+                "train_sample": TRAIN_SAMPLE,
+                "test_size": 0.2,
+                "val_size_from_train": VAL_SIZE,
+                "max_epochs": MAX_EPOCHS,
+                "patience": PATIENCE,
+                "learning_rate": LEARNING_RATE,
+                "weight_decay": WEIGHT_DECAY,
+                "batch_size": BATCH_SIZE,
+                "sequence_len": SEQUENCE_LEN,
+            }
+        }, f,
                   ensure_ascii=False, indent=2)
     print(f"\n[结果] {REPORT}")
 

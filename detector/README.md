@@ -136,8 +136,10 @@ curl -X POST http://127.0.0.1:8000/predict \
 | `POST /simulate/stop` | 停止模拟 |
 | `POST /explain` | SHAP 特征归因(解释模型判定,需 `pip install shap`) |
 | `GET /explain/{event_id}` | 按事件 ID 获取 SHAP 解释 |
+| `GET /capture/interfaces` | 列出 Scapy 可见网卡,供实时抓包选择 |
+| `GET /capture/status` | 查看实时抓包状态、包数、流数、告警数 |
 | `POST /capture/replay` | 离线 pcap 回放 `{"pcap": "path"}`(纯 Python,无需 Npcap) |
-| `POST /capture/start` | Scapy 实时抓包 `{"iface": "Ethernet"}`(需 Npcap+管理员) |
+| `POST /capture/start` | Scapy 实时抓包 `{"iface": "Ethernet", "idle_timeout": 15}`(需 Npcap+管理员) |
 | `POST /capture/stop` | 停止抓包 |
 
 ## 演示:离线 pcap 回放(无需 Npcap)
@@ -175,7 +177,33 @@ curl -X POST http://127.0.0.1:8000/capture/replay \
 3. **SYN 洪泛启发式**:同一源对同一目标聚合 >100 个 SYN 且无回包(轮换源端口);
 4. 正常流量不产生告警(产品语义)。
 
-## 实时抓包(可选)
+## 实时抓包:分析本机真实流量
+
+前置条件:
+
+- 已安装 Python 依赖: `pip install -r requirements.txt`
+- Windows 需要安装 Npcap,并勾选 WinPcap API-compatible mode
+- 以管理员权限启动终端,否则可能没有网卡抓包权限
+
+启动服务后打开面板,在顶部控制区点击 **开始实时抓包**。网卡输入框可以留空使用默认网卡,也可以从候选列表中选择 Scapy 识别到的网卡名称。页面会显示实时包数、已结算流数和告警数;检测出的真实异常流量会进入同一张告警表。
+
+也可以用 API 方式启动:
+
+```bash
+curl http://127.0.0.1:8000/capture/interfaces
+
+curl -X POST http://127.0.0.1:8000/capture/start \
+  -H "Content-Type: application/json" \
+  -d '{"iface": "", "idle_timeout": 15}'
+
+curl http://127.0.0.1:8000/capture/status
+
+curl -X POST http://127.0.0.1:8000/capture/stop
+```
+
+`idle_timeout` 表示一条流多久没有新包后结算并送入模型。默认 15 秒,比生产环境更短,适合课堂/答辩演示时快速看到分析结果。
+
+### 独立脚本方式
 
 ```python
 # 独立脚本方式

@@ -1,6 +1,6 @@
-# 可解释AI实时网络入侵检测与安全分析平台
+# 网络入侵检测与安全运营平台
 
-**Explainable AI-based Real-time Network Intrusion Detection System**
+**Explainable Real-time Network Intrusion Detection System**
 
 > 从真实网络流量到可解释告警的端到端智能安全检测平台。
 > 数据清洗 → 多模型对比 → XGBoost 最优模型 → 实时流量检测 → 告警生命周期管理 → SHAP 可解释 → Docker 一键部署。
@@ -29,7 +29,7 @@
 本项目构建一个**从流量采集到可解释告警的端到端平台**:
 
 - **机器学习驱动**:基于 CICIDS2017 公开数据集训练多分类检测模型,识别 8 类网络威胁;
-- **可解释 AI (XAI)**:集成 SHAP 特征归因,让每次告警都给出"模型为什么判定为 DDoS"的可读依据;
+- **可解释检测**:集成 SHAP 特征归因,让每次告警都给出"模型为什么判定为 DDoS"的可读依据;
 - **安全运营 (SOC)**:将检测结果组织为带风险等级、告警状态、处置建议的控制台,支持告警生命周期管理与历史溯源;
 - **工程化交付**:SQLite 持久化 + Docker 一键部署,具备真实产品的工程形态。
 
@@ -140,7 +140,7 @@
 ## 6. 实时检测流程
 
 ```
-真实流量 → Scapy 抓包 / pcap 回放 / 模拟器
+真实流量 → Scapy 实时抓包 / pcap 回放 / 模拟器
        → 按五元组聚合为"流"
        → 增量计算 69 维 CICIDS 特征
        → XGBoost 多分类:攻击类型 + 置信度
@@ -272,8 +272,8 @@ docker compose up -d --build
 
 ### 10.4 关键结论
 
-1. **树模型显著优于深度学习**:二分类 F1 0.9974(XGB) vs 0.9357(Transformer);多分类 Weighted-F1 0.9989 vs 0.9000。
-   **原因**:CICIDS2017 是"表格式手工特征",树模型天然匹配;DL 把 69 维特征排成无意义的"伪序列",且 10 epoch 欠拟合。
+1. **当前基线中树模型显著优于深度学习**:二分类 F1 0.9974(XGB) vs 0.9357(Transformer);多分类 Weighted-F1 0.9989 vs 0.9000。
+   **解释边界**:CICIDS2017 是"表格式手工特征",树模型天然匹配;DL 把 69 维特征排成"伪序列"存在结构错配。原始 DL 指标来自 10 epoch 探索性基线,训练脚本已升级为 50 epoch 上限、验证集早停和最佳权重回滚,重跑后应更新指标。
    → 详见 [`reports/experiment_analysis.md`](./reports/experiment_analysis.md)(完整实验分析)
 
 2. **类别失衡是主要难点**:`Infiltration` 全库仅 36 条,抽样后训练集 ~4 条 → 任何模型都难以学习;`Botnet` 通过逆频权重可拉到 F1 0.78。
@@ -298,6 +298,12 @@ cd detector
 python -m uvicorn api_server:app --host 127.0.0.1 --port 8000
 # 浏览器打开 http://127.0.0.1:8000
 ```
+
+### 真实流量抓包
+
+Windows 下需要先安装 Npcap,并以管理员权限启动上面的检测服务。打开前端后,在顶部控制区点击 **开始实时抓包**;网卡输入框可留空使用默认网卡,也可以从 `/capture/interfaces` 返回的列表中选择指定网卡。
+
+实时抓到的包会被聚合为 CICIDS 风格流特征,再送入 XGBoost 模型和端口扫描/SYN 洪泛行为规则。页面会显示实时包数、已结算流数、告警数;异常真实流量会进入告警表并支持详情查看和 SHAP 解释。
 
 > 检测服务详细文档见 [`detector/README.md`](./detector/README.md)
 
