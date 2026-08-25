@@ -262,6 +262,7 @@ async def explain_by_id(event_id: str) -> JSONResponse:
                             content={"error": "shap 未安装,请执行: pip install shap"})
     except Exception as exc:  # noqa: BLE001
         return JSONResponse(status_code=400, content={"error": str(exc)})
+    result["features"] = features  # 附带该事件的原始特征,供详情页"完整特征"区块展示
     db.update_shap(event_id, json.dumps(result, ensure_ascii=False))  # 缓存解释,历史可回看
     return JSONResponse(result)
 

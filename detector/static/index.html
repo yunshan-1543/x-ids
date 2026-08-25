@@ -76,6 +76,21 @@
   .shap-bar { flex:1; height:14px; background:#0d1526; border-radius:4px; overflow:hidden; }
   .shap-bar i { display:block; height:100%; border-radius:4px; }
   .shap-val { width:70px; text-align:right; font-size:12px; font-family:Consolas,monospace; }
+  .feat-details { margin-top:16px; border:1px solid var(--border); border-radius:8px;
+                  background:#0f1830; padding:10px 12px; }
+  .feat-details summary { cursor:pointer; user-select:none; font-size:13px; font-weight:600; color:var(--text); }
+  .feat-details summary:hover { color:var(--accent); }
+  .features-json { margin-top:8px; max-height:260px; overflow:auto; background:#0b1220;
+                   border:1px solid var(--border); border-radius:6px; padding:10px 12px;
+                   font-family:Consolas,monospace; font-size:11.5px; line-height:1.5; color:#a8b7d9;
+                   white-space:pre-wrap; word-break:break-all; }
+  .copy-tip { color:#22c55e; font-size:12px; animation:copyFlash 1.2s ease-out; }
+  @keyframes copyFlash {
+    0% { opacity:0; transform:translateY(2px); }
+    20% { opacity:1; transform:none; }
+    80% { opacity:1; }
+    100% { opacity:0; }
+  }
   .risk { display:inline-block; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:700; }
   .risk.HIGH { background:#3a1520; color:#f43f5e; }
   .risk.MEDIUM { background:#332a12; color:#fbbf24; }
@@ -272,6 +287,16 @@
       <div class="muted" style="margin-top:10px;">蓝色=推动判定为该攻击 · 红色=抑制 · 百分比=特征对判定的影响占比</div>
     </div>
     <div v-else class="muted">无可解释特征</div>
+
+    <details class="feat-details">
+      <summary>📊 查看完整原始特征 ({{ featureCount }}维)</summary>
+      <div style="margin-top:8px; display:flex; align-items:center; gap:8px;">
+        <button class="btn" style="padding:4px 12px; font-size:12px;" @click="copyFeatures" :disabled="!selected.features">📋 复制特征</button>
+        <span v-if="copiedTip" class="copy-tip">✓ 复制成功</span>
+      </div>
+      <pre v-if="selected.features" class="features-json">{{ featuresJson }}</pre>
+      <div v-else class="muted" style="margin-top:8px;">该事件暂无特征数据(较旧事件的特征已过期)</div>
+    </details>
   </div>
 </div>
 
@@ -431,18 +456,23 @@ createApp({
     }
 
     // 告警详情 + SHAP
+    // 把 SHAP 响应里附带的原始特征挂到 selected 上,供详情页"完整原始特征"区块展示
+    function attachFeatures() {
+      if (shap.value && shap.value.features) selected.value.features = shap.value.features;
+    }
     async function openDetail(ev) {
       selected.value = { ...ev, date: new Date().toLocaleDateString('zh-CN') };
       shap.value = null; shapError.value = '';
       // 历史告警优先使用数据库缓存的 SHAP 解释,避免重算
       if (ev.shap_result) {
-        try { shap.value = JSON.parse(ev.shap_result); return; } catch (e) { /* 缓存损坏则在线计算 */ }
+        try { shap.value = JSON.parse(ev.shap_result); attachFeatures(); return; }
+        catch (e) { /* 缓存损坏则在线计算 */ }
       }
       shapLoading.value = true;
       try {
         const r = await fetch('/explain/' + ev.id);
         const data = await r.json();
-        if (r.ok) shap.value = data;
+        if (r.ok) { shap.value = data; attachFeatures(); }
         else shapError.value = data.error || '解释失败';
       } catch (err) { shapError.value = '请求失败: ' + err.message; }
       finally { shapLoading.value = false; }
@@ -456,6 +486,37 @@ createApp({
     function fmtShare(f) {
       const pct = ((f.share_pct != null ? f.share_pct : 0)).toFixed(1);
       return (f.impact === 'push_toward' ? '+' : '−') + pct + '%';
+    }
+
+    // 详情页:完整原始特征(格式化 + 可滚动)
+    const featureCount = computed(() => selected.value?.features ? Object.keys(selected.value.features).length : 0);
+    const featuresJson = computed(() => {
+      const f = selected.value?.features;
+      if (!f) return '';
+      // 数值保留 4 位小数,便于阅读;大整数(如 1e8)不受影响
+      return JSON.stringify(f, (k, v) => (typeof v === 'number' && !Number.isInteger(v)) ? Math.round(v * 1e4) / 1e4 : v, 2);
+    });
+
+    // 一键复制特征 JSON 到剪贴板,并短暂显示"复制成功"
+    const copiedTip = ref(false);
+    let _copyTimer = null;
+    async function copyFeatures() {
+      if (!selected.value?.features) return;
+      const text = featuresJson.value;   // 与折叠区展示内容一致(完整 69 维,已格式化)
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch (e) {
+        // 剪贴板 API 不可用(如非安全上下文)时退回 execCommand 方案
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+      }
+      copiedTip.value = true;
+      clearTimeout(_copyTimer);
+      _copyTimer = setTimeout(() => { copiedTip.value = false; }, 1500);
     }
 
     onMounted(() => {
@@ -485,7 +546,8 @@ createApp({
              badgeStyle, colorOf, confColor, startSim, stopSim, replaySample, replayMsg,
              doPredict, fillSample,
              riskFilter, attackFilter, timeRange, sortMode, displayEvents, statusText, statusStyle, srcLabel, setStatus,
-             selected, shap, shapLoading, shapError, openDetail, closeDetail, shapPct, fmtShare };
+             selected, shap, shapLoading, shapError, openDetail, closeDetail, shapPct, fmtShare,
+             featureCount, featuresJson, copiedTip, copyFeatures };
   }
 }).mount('#app');
 </script>
