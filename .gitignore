@@ -23,3 +23,6 @@ __pycache__/
 .claude/
 CLAUDE.md
 .venv/
+
+# Local traffic captures, endpoint metadata and human review labels
+artifacts/traffic/

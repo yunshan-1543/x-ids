@@ -239,6 +239,8 @@ docker compose up -d --build
 
 ## 10. 实验与结果
 
+新增：[本机真实流量实测记录](./reports/real_traffic_observation.md)与[真实流量评估指南](./docs/real_traffic_evaluation.md)。本次被动观测采集 2,146 个包、结算 62 条流，重放结果一致；尚无独立标签，未计算真实流量准确率或误报率。下面的成绩仍是 CICIDS2017 离线测试结果。
+
 ### 10.1 二分类(BENIGN vs Attack,同一测试集 6 万条)
 
 | 模型 | Accuracy | Precision | Recall | F1 |
@@ -300,6 +302,14 @@ python -m uvicorn api_server:app --host 127.0.0.1 --port 8000
 ```
 
 ### 真实流量抓包
+
+独立的限时观测和报告生成入口：
+
+```powershell
+& 'D:\miniconda3\envs\ids\python.exe' detector\evaluate_traffic.py observe --seconds 60 --max-packets 20000
+```
+
+每轮输出独立目录，包含原始抓包、全部流预测、人工复核表和 Markdown 报告。没有标签时只报告观测数据；填写独立复核标签后，可对模型、规则与组合方案评分。完整命令见[评估指南](./docs/real_traffic_evaluation.md)。
 
 Windows 下需要先安装 Npcap,并以管理员权限启动上面的检测服务。打开前端后,在顶部控制区点击 **开始实时抓包**;网卡输入框可留空使用默认网卡,也可以从 `/capture/interfaces` 返回的列表中选择指定网卡。
 

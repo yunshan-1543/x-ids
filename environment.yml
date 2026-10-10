@@ -1,0 +1,20 @@
+name: ids
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - fastapi>=0.110
+      - uvicorn>=0.29
+      - xgboost>=2.0
+      - numpy
+      - pandas
+      - pyarrow
+      - scikit-learn
+      - scipy
+      - matplotlib
+      - seaborn
+      - shap>=0.45
+      - scapy>=2.5
+      - torch

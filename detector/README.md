@@ -179,6 +179,8 @@ curl -X POST http://127.0.0.1:8000/capture/replay \
 
 ## 实时抓包:分析本机真实流量
 
+需要可重复的限时观测、逐流记录和标签指标时，使用新增的 `evaluate_traffic.py`。详见[真实流量评估指南](../docs/real_traffic_evaluation.md)和[首轮实测记录](../reports/real_traffic_observation.md)。该工具和 API 共用 `detection.py` 检测引擎。
+
 前置条件:
 
 - 已安装 Python 依赖: `pip install -r requirements.txt`
@@ -217,6 +219,7 @@ def on_flow(features, meta):
 sniff_loop(on_flow=on_flow)   # 需要 scapy + Npcap + 管理员权限
 ```
 
-注意事项:本项目的 `flow_extractor.py` 对 CICIDS 特征做了近似(header_length /
-subflow / active_idle 等),与官方 CICFlowMeter 存在偏差,实时检测准确率会低于
-离线评测。生产级特征对齐建议改用 CICFlowMeter / Zeek 输出后接入 `/predict`。
+注意事项:本项目的 `flow_extractor.py` 已统一时间统计单位为微秒,但 header_length、
+subflow、active/idle 等仍有近似,与官方 CICFlowMeter 尚未完成逐列对齐。
+真实流量准确率需要独立标签评估,不能仅凭离线成绩推断。
+采用其他提取器时也需要核对特征定义、单位、方向和顺序。

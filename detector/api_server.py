@@ -42,7 +42,8 @@ import inference as inf   # 用模块引用,避免 from-import 绑定旧列表�
 from inference import load_model, predict
 from explain import explain
 import evidence
-from flow_extractor import PortScanDetector, SynFloodDetector, replay_pcap
+from flow_extractor import replay_pcap
+from detection import DetectionEngine
 from simulate import run_simulator
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -88,6 +89,14 @@ def _emit_event(ev: dict) -> None:
 _feature_store: dict[str, dict] = {}   # event_id -> 特征(供详情页 SHAP 解释)
 
 
+def _as_feature_dict(features):
+    """把 69 维列表输入转成 {特征名: 值}，供证据规则与 SHAP 复用。
+    inference 同时接受 dict 与 list，但 evidence/SHAP 需要具名字段。"""
+    if isinstance(features, (list, tuple)) or hasattr(features, "tolist"):
+        return {col: float(v) for col, v in zip(inf._feature_cols, features)}
+    return features
+
+
 def _handle_detection(attack: str, confidence: float, src: str,
                       features=None, meta=None, extras=None) -> dict:
     ev = _make_event(attack, confidence, src, features, meta, extras)
@@ -130,16 +139,14 @@ _sim_stop: threading.Event | None = None
 
 def _simulate_emit(attack, confidence, src, features, meta) -> None:
     # 模拟器返回 numpy 向量,转成 {特征名: 值} dict,便于证据规则与 SHAP 复用
-    if isinstance(features, (list, tuple)) or hasattr(features, "tolist"):
-        features = {col: float(v) for col, v in zip(inf._feature_cols, features)}
-    _handle_detection(attack, confidence, "simulate", features=features, meta=meta)
+    _handle_detection(attack, confidence, "simulate",
+                      features=_as_feature_dict(features), meta=meta)
 
 
 # ---------------- 实时抓包 / pcap 回放 ----------------
 _capture_thread: threading.Thread | None = None
 _capture_stop: threading.Event | None = None
-_scan = PortScanDetector(max_ports=15, window=30.0)
-_syn_flood = SynFloodDetector(max_syn=100, window=10.0)
+_capture_engine = DetectionEngine()
 _capture_stats = {
     "active": False,
     "mode": "",
@@ -156,8 +163,10 @@ def _capture_emit(features: dict, meta: dict) -> None:
     """每个到期流:模型判定 + 行为启发式(端口扫描 / SYN 洪泛)。
     产品语义:正常流量不产生告警,只上报异常事件。"""
     try:
-        r = predict(features)
-    except Exception:  # noqa: BLE001
+        decision = _capture_engine.detect(features, meta)
+        r = decision["model"]
+    except Exception as exc:  # noqa: BLE001
+        _capture_stats["last_error"] = str(exc)
         return
 
     _capture_stats["flows"] += 1
@@ -166,32 +175,18 @@ def _capture_emit(features: dict, meta: dict) -> None:
         _handle_detection(r["attack"], r["confidence"], "capture",
                           features=features, meta=meta)
 
-    hit = _scan.feed(meta)
-    if hit:
+    for hit in decision["rules"]:
         _capture_stats["alerts"] += 1
+        is_scan = hit["rule"] == "port_scan"
+        message = (f"来源 {hit['src_ip']} 在流量时间窗内探测了 {hit['ports']} 个目标端口"
+                   if is_scan else
+                   f"来源 {hit['src_ip']} 对 {hit['dst_ip']}:{hit['dst_port']} "
+                   f"聚合 {hit['syn']} 个 SYN 且无回包")
         _handle_detection(
-            "PortScan", 0.92, "capture",
-            features={},
-            meta={"src_ip": hit["src_ip"], "dst_ip": hit.get("dst_ip", ""),
-                  "dst_port": 0, "proto": "TCP"},
-            extras={
-                "confidence": 0.92,
-                "evidence": [f"来源 {hit['src_ip']} 在时间窗内探测了 {hit['ports']} 个目标端口",
-                             "行为模式符合端口扫描(模型单流特征无法覆盖)"],
-            })
-
-    flood = _syn_flood.feed(features, meta)
-    if flood:
-        _capture_stats["alerts"] += 1
-        _handle_detection(
-            "DoS", 0.93, "capture",
-            features=features, meta=meta,
-            extras={
-                "confidence": 0.93,
-                "evidence": [f"来源 {flood['src_ip']} 对 {flood['dst_ip']}:{flood['dst_port']} "
-                             f"聚合 {flood['syn']} 个 SYN 且无回包",
-                             "行为模式符合 SYN 洪泛(轮换源端口,需跨流聚合)"],
-            })
+            hit["attack"], 0.92 if is_scan else 0.93, "capture",
+            features={} if is_scan else features, meta=meta,
+            extras={"evidence": [message, "跨流行为规则命中；分数为固定展示值，未经概率校准"],
+                    "detector": hit["rule"]})
 
 
 # ---------------- FastAPI 应用 ----------------
@@ -244,7 +239,8 @@ async def predict_endpoint(request: Request) -> JSONResponse:
         result = predict(payload)
     except Exception as exc:  # noqa: BLE001
         return JSONResponse(status_code=400, content={"error": str(exc)})
-    _handle_detection(result["attack"], result["confidence"], "api", features=payload)
+    _handle_detection(result["attack"], result["confidence"], "api",
+                      features=_as_feature_dict(payload))
     return JSONResponse(result)
 
 
@@ -396,18 +392,23 @@ async def simulate_clear() -> JSONResponse:
 @app.post("/capture/start")
 async def capture_start(payload: dict | None = None) -> JSONResponse:
     """Scapy 实时抓包。需要 scapy + Npcap + 管理员权限。"""
-    global _capture_thread, _capture_stop
+    global _capture_thread, _capture_stop, _capture_engine
     if _capture_thread and _capture_thread.is_alive():
         return JSONResponse({"status": "already_running"})
     from flow_extractor import _SCAPY_OK, sniff_loop
     if not _SCAPY_OK:
         return JSONResponse(status_code=400, content={
             "error": "scapy 未安装或不可用,请执行 pip install scapy 并安装 Npcap"})
+    from scapy.all import conf
+    if sys.platform == "win32" and not conf.use_pcap:
+        return JSONResponse(status_code=400, content={
+            "error": "Npcap 不可用，请安装后重新启动后端进程"})
     payload = payload or {}
     iface = (payload.get("iface") or "").strip() or None
     idle_timeout = float(payload.get("idle_timeout") or 15.0)
     bpf_filter = (payload.get("filter") or "").strip() or None
     _capture_stop = threading.Event()
+    _capture_engine = DetectionEngine()
 
     def _on_packet(_pkt) -> None:
         _capture_stats["packets"] += 1
@@ -475,7 +476,7 @@ async def capture_interfaces() -> JSONResponse:
 async def capture_replay(payload: dict | None = None) -> JSONResponse:
     """离线 pcap 回放:把 pcap 文件逐包解析成流并检测(纯 Python,无需 Npcap)。
     传 {"sample": true} 使用项目自带样本 test_flows.pcap。"""
-    global _capture_thread
+    global _capture_thread, _capture_engine
     payload = payload or {}
     pcap = payload.get("pcap", "")
     if not pcap and payload.get("sample"):
@@ -486,7 +487,20 @@ async def capture_replay(payload: dict | None = None) -> JSONResponse:
         return JSONResponse(status_code=400, content={"error": f"文件不存在: {pcap}"})
     if _capture_thread and _capture_thread.is_alive():
         return JSONResponse({"status": "busy"})
-    _capture_thread = threading.Thread(
-        target=replay_pcap, args=(pcap,), kwargs={"on_flow": _capture_emit}, daemon=True)
+    _capture_engine = DetectionEngine()
+
+    def _run_replay():
+        _capture_stats.update({"active": True, "mode": "replay", "iface": "",
+                               "started_at": time.time(), "packets": 0,
+                               "flows": 0, "alerts": 0, "last_error": ""})
+        try:
+            replay_pcap(pcap, on_flow=_capture_emit,
+                        progress=lambda count, _total: _capture_stats.update(packets=count))
+        except Exception as exc:  # noqa: BLE001
+            _capture_stats["last_error"] = str(exc)
+        finally:
+            _capture_stats["active"] = False
+
+    _capture_thread = threading.Thread(target=_run_replay, daemon=True)
     _capture_thread.start()
     return JSONResponse({"status": "started", "pcap": pcap})

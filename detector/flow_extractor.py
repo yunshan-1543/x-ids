@@ -35,6 +35,7 @@ import inference as inf   # 模块引用,避免 from-import 在 load_model 前�
 
 IDLE_TIMEOUT = 120.0     # 流空闲超时(秒),超时即判定
 ACTIVE_GAP = 2.0         # 活跃突发判定阈值(秒)
+FEATURE_VERSION = "scapy-flow-v2-microseconds"
 
 # TCP 标志位位掩码(Scapy FlagValue 属性是大写字母,统一用位掩码统计)
 _FLAG_BITS = {"FIN": 0x01, "SYN": 0x02, "RST": 0x04, "PSH": 0x08,
@@ -60,11 +61,11 @@ def _std(vals) -> float:
 def _header_len(pkt) -> int:
     hl = 0
     if IP in pkt:
-        hl += int(pkt[IP].ihl) * 4
+        hl += int(pkt[IP].ihl or 5) * 4
     elif IPv6 in pkt:
         hl += 40
     if TCP in pkt:
-        hl += int(pkt[TCP].dataofs) * 4
+        hl += int(pkt[TCP].dataofs or 5) * 4
     elif UDP in pkt:
         hl += 8
     elif ICMP in pkt:
@@ -144,12 +145,15 @@ class Flow:
         return {
             "src_ip": self.src_ip,
             "dst_ip": self.dst_ip,
+            "src_port": self.sport,
             "dst_port": self.dport,
             "proto": _PROTO_NAMES.get(self.proto, str(self.proto)),
+            "start_ts": self.start,
+            "end_ts": self.last,
         }
 
     def _iat(self, ts_list):
-        return [b - a for a, b in zip(ts_list, ts_list[1:])]
+        return [(b - a) * 1e6 for a, b in zip(ts_list, ts_list[1:])]
 
     def _active_idle(self):
         ts = sorted(self.all_ts)
@@ -167,13 +171,14 @@ class Flow:
                 burst_start = t
                 prev = t
         active.append(prev - burst_start)
-        return (active if active else [0.0]), (idle if idle else [0.0])
+        return ([v * 1e6 for v in active] or [0.0],
+                [v * 1e6 for v in idle] or [0.0])
 
     def to_features(self) -> dict:
         """按模型特征顺序输出 69 维特征(值域对齐 CICIDS:时长微秒、比值等)。"""
         n_fwd, n_bwd = len(self.fwd_len), len(self.bwd_len)
         n_pkt = n_fwd + n_bwd
-        dur = (self.last - self.start) if (self.start and self.last) else 0.0
+        dur = (self.last - self.start) if self.start is not None else 0.0
         dur_us = dur * 1e6
         total = self.fwd_total + self.bwd_total
         all_len = self.fwd_len + self.bwd_len
@@ -266,6 +271,8 @@ class FlowExtractor:
     """按五元组聚合包的流提取器。"""
 
     def __init__(self, idle_timeout: float = IDLE_TIMEOUT):
+        if not np.isfinite(idle_timeout) or idle_timeout <= 0:
+            raise ValueError("idle_timeout must be finite and positive")
         self.flows: dict = {}
         self.idle_timeout = idle_timeout
 
@@ -286,12 +293,12 @@ class FlowExtractor:
             sport, dport = 0, 0
         return src, dst, sport, dport, proto
 
-    def process(self, pkt, ts=None) -> None:
+    def process(self, pkt, ts=None) -> bool:
         if not _SCAPY_OK:
-            return
+            return False
         t = self._tuple(pkt)
         if t is None:
-            return
+            return False
         src, dst, sport, dport, proto = t
         fwd_key = (src, dst, sport, dport, proto)
         rev_key = (dst, src, dport, sport, proto)
@@ -304,12 +311,14 @@ class FlowExtractor:
             self.flows[fwd_key] = flow
             is_fwd = True
         flow.add(pkt, ts if ts is not None else time.time(), is_fwd)
+        return True
 
     def expire(self, now=None) -> list[tuple[dict, dict]]:
         """返回已超时流的 (特征字典, 元数据),并从字典中移除。"""
         now = now if now is not None else time.time()
         out = []
-        for key in list(self.flows):
+        # Chronological finalization keeps cross-flow rule windows reproducible.
+        for key in sorted(self.flows, key=lambda k: self.flows[k].last):
             flow = self.flows[key]
             if now - flow.last > self.idle_timeout:
                 out.append((flow.to_features(), flow.to_meta()))
@@ -334,7 +343,11 @@ def sniff_loop(interface=None, on_flow=None, on_packet=None, count=None,
     def _pkt(pkt):
         nonlocal seen
         seen += 1
-        extractor.process(pkt)
+        ts = float(pkt.time)
+        for feat, meta in extractor.expire(now=ts):
+            if on_flow:
+                on_flow(feat, meta)
+        extractor.process(pkt, ts=ts)
         if on_packet:
             on_packet(pkt)
         for feat, meta in extractor.expire():
@@ -361,7 +374,7 @@ def sniff_loop(interface=None, on_flow=None, on_packet=None, count=None,
             on_flow(feat, meta)
 
 
-def replay_pcap(path: str, on_flow=None, progress=None):
+def replay_pcap(path: str, on_flow=None, progress=None, idle_timeout=15.0):
     """读取 pcap 文件,逐包喂入 FlowExtractor,回调 on_flow(features, meta)。
 
     纯 Python 解析,不需要 Npcap,用于离线流量验证与演示。
@@ -369,19 +382,25 @@ def replay_pcap(path: str, on_flow=None, progress=None):
     if not _SCAPY_OK:
         print("[scapy] 未安装: pip install scapy 后才能解析 pcap")
         return
-    from scapy.all import rdpcap
+    from scapy.all import PcapReader
 
-    extractor = FlowExtractor(idle_timeout=1.0)  # 回放用短超时,尽快结算流
-    pkts = rdpcap(path)
-    total = len(pkts)
-    for i, pkt in enumerate(pkts):
-        ts = float(getattr(pkt, "time", 0) or 0)
-        extractor.process(pkt, ts=ts)
-        for feat, meta in extractor.expire(now=ts):
-            if on_flow:
-                on_flow(feat, meta)
-        if progress and i % 200 == 0:
-            progress(i + 1, total)
+    extractor = FlowExtractor(idle_timeout=idle_timeout)
+    total = 0
+    previous_ts = None
+    with PcapReader(path) as pkts:
+        for pkt in pkts:
+            ts = float(pkt.time)
+            if not np.isfinite(ts) or (previous_ts is not None and ts < previous_ts):
+                raise ValueError("PCAP timestamps must be finite and nondecreasing")
+            previous_ts = ts
+            # Expire before adding: a reused five-tuple after an idle gap is a new flow.
+            for feat, meta in extractor.expire(now=ts):
+                if on_flow:
+                    on_flow(feat, meta)
+            extractor.process(pkt, ts=ts)
+            total += 1
+            if progress:
+                progress(total, None)
     for feat, meta in extractor.expire(now=float("inf")):  # 剩余流全部结算
         if on_flow:
             on_flow(feat, meta)
